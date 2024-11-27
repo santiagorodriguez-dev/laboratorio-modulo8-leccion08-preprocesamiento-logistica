@@ -1,7 +1,11 @@
+
 # Tratamiento de datos
 # -----------------------------------------------------------------------
 import pandas as pd
 import numpy as np
+
+import time
+import psutil
 
 # Visualizaciones
 # -----------------------------------------------------------------------
@@ -15,6 +19,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import train_test_split, learning_curve, GridSearchCV, cross_val_score, StratifiedKFold, KFold
+import xgboost as xgb
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -24,13 +29,13 @@ from sklearn.metrics import (
     cohen_kappa_score,
     confusion_matrix
 )
-import xgboost as xgb
-import pickle
+import shap
 
 # Para realizar cross validation
 # -----------------------------------------------------------------------
 from sklearn.model_selection import StratifiedKFold, cross_val_score, KFold
 from sklearn.preprocessing import KBinsDiscretizer
+
 
 
 class AnalisisModelosClasificacion:
@@ -53,7 +58,7 @@ class AnalisisModelosClasificacion:
         }
         self.resultados = {nombre: {"mejor_modelo": None, "pred_train": None, "pred_test": None} for nombre in self.modelos}
 
-    def ajustar_modelo(self, modelo_nombre, param_grid=None, cross_validation = 5):
+    def ajustar_modelo(self, modelo_nombre, param_grid=None):
         """
         Ajusta el modelo seleccionado con GridSearchCV.
         """
@@ -64,12 +69,6 @@ class AnalisisModelosClasificacion:
 
         # Parámetros predeterminados por modelo
         parametros_default = {
-            "logistic_regression": {
-                'penalty': ['l1', 'l2', 'elasticnet', 'none'],
-                'C': [0.01, 0.1, 1, 10, 100],
-                'solver': ['liblinear', 'saga'],
-                'max_iter': [100, 200, 500]
-            },
             "tree": {
                 'max_depth': [3, 5, 7, 10],
                 'min_samples_split': [2, 5, 10],
@@ -77,10 +76,9 @@ class AnalisisModelosClasificacion:
             },
             "random_forest": {
                 'n_estimators': [50, 100, 200],
-                'max_depth': [None, 10, 20, 30],
+                'max_depth': [2, 6, 8, 20, 12, 16],
                 'min_samples_split': [2, 5, 10],
-                'min_samples_leaf': [1, 2, 4],
-                'max_features': ['auto', 'sqrt', 'log2']
+                'min_samples_leaf': [1, 2, 4]
             },
             "gradient_boosting": {
                 'n_estimators': [100, 200],
@@ -103,24 +101,29 @@ class AnalisisModelosClasificacion:
         if param_grid is None:
             param_grid = parametros_default.get(modelo_nombre, {})
 
-        # Ajuste del modelo
-        grid_search = GridSearchCV(estimator=modelo, 
-                                   param_grid=param_grid, 
-                                   cv=cross_validation, 
-                                   scoring='accuracy')
-        
-        grid_search.fit(self.X_train, self.y_train)
-        self.resultados[modelo_nombre]["mejor_modelo"] = grid_search.best_estimator_
-        self.resultados[modelo_nombre]["pred_train"] = grid_search.best_estimator_.predict(self.X_train)
-        self.resultados[modelo_nombre]["pred_test"] = grid_search.best_estimator_.predict(self.X_test)
+        if modelo_nombre == "logistic_regression":
+            modelo_logistica = LogisticRegression(random_state=42, n_jobs=psutil.cpu_count(logical=True))
+            modelo_logistica.fit(self.X_train, self.y_train)
+            self.resultados[modelo_nombre]["pred_train"] = modelo_logistica.predict(self.X_train)
+            self.resultados[modelo_nombre]["pred_test"] = modelo_logistica.predict(self.X_test)
+            self.resultados[modelo_nombre]["mejor_modelo"] = modelo_logistica
 
-        # Guardar el modelo
-        with open('mejor_modelo.pkl', 'wb') as f:
-            pickle.dump(grid_search.best_estimator_, f)
+        else:
+            # Ajuste del modelo
+            grid_search = GridSearchCV(estimator=modelo, param_grid=param_grid, cv=5, scoring='accuracy',n_jobs=psutil.cpu_count(logical=True))
+            grid_search.fit(self.X_train, self.y_train)
+            print(f"El mejor modelo es {grid_search.best_estimator_}")
+            self.resultados[modelo_nombre]["mejor_modelo"] = grid_search.best_estimator_
+            self.resultados[modelo_nombre]["pred_train"] = grid_search.best_estimator_.predict(self.X_train)
+            self.resultados[modelo_nombre]["pred_test"] = grid_search.best_estimator_.predict(self.X_test)
+
+
+
 
     def calcular_metricas(self, modelo_nombre):
         """
-        Calcula métricas de rendimiento para el modelo seleccionado, incluyendo AUC y Kappa.
+        Calcula métricas de rendimiento para el modelo seleccionado, incluyendo AUC, Kappa,
+        tiempo de computación y núcleos utilizados.
         """
         if modelo_nombre not in self.resultados:
             raise ValueError(f"Modelo '{modelo_nombre}' no reconocido.")
@@ -131,13 +134,19 @@ class AnalisisModelosClasificacion:
         if pred_train is None or pred_test is None:
             raise ValueError(f"Debe ajustar el modelo '{modelo_nombre}' antes de calcular métricas.")
         
-        # Calcular probabilidades para AUC (si el modelo las soporta)
         modelo = self.resultados[modelo_nombre]["mejor_modelo"]
+
+        # Registrar tiempo de ejecución
+        start_time = time.time()
         if hasattr(modelo, "predict_proba"):
             prob_train = modelo.predict_proba(self.X_train)[:, 1]
             prob_test = modelo.predict_proba(self.X_test)[:, 1]
         else:
-            prob_train = prob_test = None  # Si no hay probabilidades, AUC no será calculado
+            prob_train = prob_test = None
+        elapsed_time = time.time() - start_time
+
+        # Registrar núcleos utilizados
+        num_nucleos = getattr(modelo, "n_jobs", psutil.cpu_count(logical=True))
 
         # Métricas para conjunto de entrenamiento
         metricas_train = {
@@ -146,7 +155,9 @@ class AnalisisModelosClasificacion:
             "recall": recall_score(self.y_train, pred_train, average='weighted', zero_division=0),
             "f1": f1_score(self.y_train, pred_train, average='weighted', zero_division=0),
             "kappa": cohen_kappa_score(self.y_train, pred_train),
-            "auc": roc_auc_score(self.y_train, prob_train) if prob_train is not None else None
+            "auc": roc_auc_score(self.y_train, prob_train) if prob_train is not None else None,
+            "time_seconds": elapsed_time,
+            "n_jobs": num_nucleos
         }
 
         # Métricas para conjunto de prueba
@@ -156,11 +167,13 @@ class AnalisisModelosClasificacion:
             "recall": recall_score(self.y_test, pred_test, average='weighted', zero_division=0),
             "f1": f1_score(self.y_test, pred_test, average='weighted', zero_division=0),
             "kappa": cohen_kappa_score(self.y_test, pred_test),
-            "auc": roc_auc_score(self.y_test, prob_test) if prob_test is not None else None
+            "auc": roc_auc_score(self.y_test, prob_test) if prob_test is not None else None,
+            "tiempo_computacion(segundos)": elapsed_time,
+            "nucleos_usados": num_nucleos
         }
 
         # Combinar métricas en un DataFrame
-        return pd.DataFrame({"train": metricas_train, "test": metricas_test})
+        return pd.DataFrame({"train": metricas_train, "test": metricas_test}).T
 
     def plot_matriz_confusion(self, modelo_nombre):
         """
@@ -182,7 +195,6 @@ class AnalisisModelosClasificacion:
         plt.xlabel("Predicción")
         plt.ylabel("Valor Real")
         plt.show()
-    
     def importancia_predictores(self, modelo_nombre):
         """
         Calcula y grafica la importancia de las características para el modelo seleccionado.
@@ -215,3 +227,55 @@ class AnalisisModelosClasificacion:
         plt.xlabel("Importancia")
         plt.ylabel("Características")
         plt.show()
+
+    def plot_shap_summary(self, modelo_nombre):
+        """
+        Genera un SHAP summary plot para el modelo seleccionado.
+        Maneja correctamente modelos de clasificación con múltiples clases.
+        """
+        if modelo_nombre not in self.resultados:
+            raise ValueError(f"Modelo '{modelo_nombre}' no reconocido.")
+
+        modelo = self.resultados[modelo_nombre]["mejor_modelo"]
+
+        if modelo is None:
+            raise ValueError(f"Debe ajustar el modelo '{modelo_nombre}' antes de generar el SHAP plot.")
+
+        # Usar TreeExplainer para modelos basados en árboles
+        if modelo_nombre in ["tree", "random_forest", "gradient_boosting", "xgboost"]:
+            explainer = shap.TreeExplainer(modelo)
+            shap_values = explainer.shap_values(self.X_test)
+
+            # Verificar si los SHAP values tienen múltiples clases (dimensión 3)
+            if isinstance(shap_values, list):
+                # Para modelos binarios, seleccionar SHAP values de la clase positiva
+                shap_values = shap_values[1]
+            elif len(shap_values.shape) == 3:
+                # Para Decision Trees, seleccionar SHAP values de la clase positiva
+                shap_values = shap_values[:, :, 1]
+        else:
+            # Usar el explicador genérico para otros modelos
+            explainer = shap.Explainer(modelo, self.X_test, check_additivity=False)
+            shap_values = explainer(self.X_test).values
+
+        # Generar el summary plot estándar
+        shap.summary_plot(shap_values, self.X_test, feature_names=self.X.columns)
+
+# Función para asignar colores
+def color_filas_por_modelo(row):
+    if row["modelo"] == "decision tree":
+        return ["background-color: #e6b3e0; color: black"] * len(row)  
+    
+    elif row["modelo"] == "random_forest":
+        return ["background-color: #c2f0c2; color: black"] * len(row) 
+
+    elif row["modelo"] == "gradient_boosting":
+        return ["background-color: #ffd9b3; color: black"] * len(row)  
+
+    elif row["modelo"] == "xgboost":
+        return ["background-color: #f7b3c2; color: black"] * len(row)  
+
+    elif row["modelo"] == "regresion lineal":
+        return ["background-color: #b3d1ff; color: black"] * len(row)  
+    
+    return ["color: black"] * len(row)
